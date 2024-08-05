@@ -3,10 +3,12 @@ package providers
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/exp/slices"
@@ -28,12 +30,32 @@ type AzureProvider struct {
 	isV2Endpoint    bool
 }
 
+// AccessToken represents a client_credentials flow access token for oauth2-proxy to read groups from Microsoft Graph w/ application permissions
+type AccessToken struct {
+	TokenType   string `json:"token_type"`
+	AccessToken string `json:"access_token"`
+	ExpiresIn   int64  `json:"expires_in"`
+	Expiry      time.Time
+}
+
+// Simple cache for group lookups
+type GroupCache struct {
+	items map[string]GroupCacheItem
+	mu    sync.RWMutex
+}
+
+type GroupCacheItem struct {
+	Groups []string
+	Expiry time.Time
+}
+
 var _ Provider = (*AzureProvider)(nil)
 
 const (
 	azureProviderName           = "Azure"
 	azureDefaultScope           = "openid"
 	azureDefaultGraphGroupField = "id"
+	groupCacheTTL               = 5 * time.Minute
 )
 
 var (
@@ -56,6 +78,15 @@ var (
 		Scheme: "https",
 		Host:   "graph.microsoft.com",
 		Path:   "/v1.0/me",
+	}
+
+	// Simple cache so that we don't request a new access token for every request
+	cachedAccessToken *AccessToken
+	accessTokenMutex  sync.Mutex
+
+	// Simple cache so that we don't lookup groups on every request
+	groupCache = &GroupCache{
+		items: make(map[string]GroupCacheItem),
 	}
 )
 
@@ -90,17 +121,20 @@ func NewAzureProvider(p *ProviderData, opts options.AzureOptions) *AzureProvider
 	isV2Endpoint := false
 	if strings.Contains(p.LoginURL.String(), "v2.0") {
 		isV2Endpoint = true
-		azureV2GraphScope := fmt.Sprintf("https://%s/.default", p.ProfileURL.Host)
 
-		if strings.Contains(p.Scope, " groups") {
-			logger.Print("WARNING: `groups` scope is not an accepted scope when using Azure OAuth V2 endpoint. Removing it from the scope list")
-			p.Scope = strings.ReplaceAll(p.Scope, " groups", "")
-		}
+		// /start:DELETED - hardcoding `https://graph.microsoft.com/.default` is a bad value that unnecessarily breaks auth flows
+		// azureV2GraphScope := fmt.Sprintf("https://%s/.default", p.ProfileURL.Host)
 
-		if !strings.Contains(p.Scope, " "+azureV2GraphScope) {
-			// In order to be able to query MS Graph we must pass the ms graph default endpoint
-			p.Scope += " " + azureV2GraphScope
-		}
+		// if strings.Contains(p.Scope, " groups") {
+		// 	logger.Print("WARNING: `groups` scope is not an accepted scope when using Azure OAuth V2 endpoint. Removing it from the scope list")
+		// 	p.Scope = strings.ReplaceAll(p.Scope, " groups", "")
+		// }
+
+		// if !strings.Contains(p.Scope, " "+azureV2GraphScope) {
+		// 	// In order to be able to query MS Graph we must pass the ms graph default endpoint
+		// 	p.Scope += " " + azureV2GraphScope
+		// }
+		// /end:DELETED
 
 		if p.ProtectedResource != nil && p.ProtectedResource.String() != "" {
 			logger.Print("WARNING: `--resource` option has no effect when using the Azure OAuth V2 endpoint.")
@@ -456,4 +490,151 @@ func getEmailFromJSON(json *simplejson.Json) (string, error) {
 // ValidateSession validates the AccessToken
 func (p *AzureProvider) ValidateSession(ctx context.Context, s *sessions.SessionState) bool {
 	return validateToken(ctx, p, s.AccessToken, makeAzureHeader(s.AccessToken))
+}
+
+// Ensure that groups are available for Service Principal tokens
+func (p *AzureProvider) CreateSessionFromToken(ctx context.Context, token string) (*sessions.SessionState, error) {
+	ss, err := p.Data().CreateSessionFromToken(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("could not create session from token: %v", err)
+	}
+
+	oid, err := p.getObjectId(ss)
+	if err != nil {
+		return nil, fmt.Errorf("could not get oid from token: %v", err)
+	}
+
+	// use groups from the token if present
+	if len(ss.Groups) > 0 {
+		return ss, nil
+	}
+
+	// use cached groups if available
+	groupCache.mu.RLock()
+	item, ok := groupCache.items[oid]
+	groupCache.mu.RUnlock()
+	if ok && item.Expiry.After(time.Now()) {
+		ss.Groups = item.Groups
+		return ss, nil
+	}
+
+	// read and cache overage groups from Microsoft Graph
+	groupCache.mu.Lock()
+	defer groupCache.mu.Unlock()
+	groups, err := p.getGroupsFromMicrosoftGraph(ctx, oid)
+	if err != nil {
+		return nil, fmt.Errorf("unable to get groups from Microsoft Graph: %v", err)
+	}
+	ss.Groups = groups
+	groupCache.items[oid] = GroupCacheItem{
+		Groups: groups,
+		Expiry: time.Now().Add(groupCacheTTL),
+	}
+
+	return ss, nil
+}
+
+// read the oid claim from the token
+// https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference#payload-claims
+func (p *AzureProvider) getObjectId(ss *sessions.SessionState) (string, error) {
+	claims, err := p.getClaimExtractor(ss.IDToken, ss.AccessToken)
+	if err != nil {
+		return "", fmt.Errorf("could not get claims from token: %v", err)
+	}
+
+	values, exists, err := claims.GetClaim("oid")
+	if err != nil {
+		return "", fmt.Errorf("could not get oid claim: %v", err)
+	}
+	if !exists {
+		return "", fmt.Errorf("could not find oid claim")
+	}
+
+	oid, ok := values.(string)
+	if !ok {
+		return "", fmt.Errorf("could not convert oid claim to string")
+	}
+
+	return oid, nil
+}
+
+// Retrieve and cache an application access token
+func (p *AzureProvider) getAppAccessToken(ctx context.Context, scope string) (string, error) {
+	accessTokenMutex.Lock()
+	defer accessTokenMutex.Unlock()
+
+	if cachedAccessToken != nil && cachedAccessToken.Expiry.After(time.Now()) {
+		return cachedAccessToken.AccessToken, nil
+	}
+
+	logger.Print("Getting new application access token")
+	params := url.Values{}
+	clientSecret, err := p.GetClientSecret()
+	if err != nil {
+		return "", err
+	}
+
+	params.Add("client_id", p.ClientID)
+	params.Add("client_secret", clientSecret)
+	params.Add("grant_type", "client_credentials")
+	params.Add("scope", scope)
+
+	err = requests.New(p.RedeemURL.String()).
+		WithContext(ctx).
+		WithMethod("POST").
+		WithBody(bytes.NewBufferString(params.Encode())).
+		SetHeader("Content-Type", "application/x-www-form-urlencoded").
+		Do().
+		UnmarshalInto(&cachedAccessToken)
+	if err != nil {
+		return "", err
+	}
+
+	// cache tokens for 1min less than the expiry time
+	expiresIn := cachedAccessToken.ExpiresIn - 60
+	cachedAccessToken.Expiry = time.Now().Add(time.Duration(expiresIn) * time.Second)
+
+	return cachedAccessToken.AccessToken, nil
+}
+
+// Retrieve groups from Microsoft Graph
+func (p *AzureProvider) getGroupsFromMicrosoftGraph(ctx context.Context, oid string) ([]string, error) {
+	logger.Printf("Getting groups for oid: %s", oid)
+	accessToken, err := p.getAppAccessToken(ctx, "https://graph.microsoft.com/.default")
+	if err != nil {
+		return nil, fmt.Errorf("could not get app access token: %v", err)
+	}
+
+	// Read groups by objectId, which works for both users and service principals
+	// https://learn.microsoft.com/en-us/graph/api/directoryobject-getmemberobjects?view=graph-rest-1.0&tabs=http
+	groupsURL := fmt.Sprintf("https://graph.microsoft.com/v1.0/%s/directoryObjects/%s/getMemberObjects", p.Tenant, oid)
+	extraHeader := makeAzureHeader(accessToken)
+	extraHeader.Add("ConsistencyLevel", "eventual")
+	extraHeader.Add("Content-Type", "application/json")
+	requestBody := map[string]interface{}{
+		"securityEnabledOnly": true,
+	}
+	requestBodyBytes, err := json.Marshal(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("unable to marshal request body: %v", err)
+	}
+
+	jsonResponse, err := requests.New(groupsURL).
+		WithContext(ctx).
+		WithMethod("POST").
+		WithHeaders(extraHeader).
+		WithBody(bytes.NewBuffer(requestBodyBytes)).
+		Do().
+		UnmarshalSimpleJSON()
+	if err != nil {
+		return nil, fmt.Errorf("unable to unmarshal Microsoft Graph response: %v", err)
+	}
+
+	var groups []string
+	for i := range jsonResponse.Get("value").MustArray() {
+		value := jsonResponse.Get("value").GetIndex(i).MustString()
+		groups = append(groups, value)
+	}
+
+	return groups, nil
 }
